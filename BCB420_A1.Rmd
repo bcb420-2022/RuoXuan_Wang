@@ -1,0 +1,261 @@
+---
+title: "BCB420 Assignment 1"
+author: "Rochelle (Ruoxuan) Wang"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+This notebook details the workflow producing a clean, normalized dataset.\
+Before we start working with data, we need to make sure all required packages are present.
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# if (!requireNamespace("GEOmetadb", quietly = TRUE)) 
+#  BiocManager::install("GEOmetadb")
+# did not end up using as documented in Journal
+
+if (!requireNamespace("GEOquery", quietly = TRUE))
+  BiocManager::install("GEOquery")
+
+if (!requireNamespace("edgeR", quietly = TRUE))
+  BiocManager::install("edgeR")
+
+library(BiocManager)
+library(GEOmetadb)
+library(edgeR)
+library(knitr)
+
+```
+
+# Select an Expression Data Set
+The dataset GSE157852 was obtained through a search of GEO, as further detailed in my journal. The GEOMetadb package could also be used, but using the webpage made it easier to click through to the paper to explore the topic being investigated.
+
+```{r}
+#GEO accession of selected dataset
+geoID <- "GSE157852"
+```
+Next, we download the expression data from GEO.
+
+# Clean the data and map to HUGO symbols
+## 1 - Download the data
+We use the GEOquery Bioconductor package to download data so the workflow can be better reproduced. We only download the dataset when necessary, as indicated by the lack of a corresponding directory.
+
+```{r}
+#GEOquery Bioconductor package to download data
+#download only when necessary
+
+#get the GEO description of dataset
+if (!exists("gse")) {
+  gse <- getGEO(geoID,GSEMatrix=FALSE)
+}
+
+#expression data
+if (!dir.exists(geoID)) {
+  #download expression data
+  sfiles <- getGEOSuppFiles(geoID)
+  filenames <- rownames(sfiles)
+  
+  # there is only one supplemental file
+  countfile <- filenames[1]
+} else {
+  countfile <- '/home/rstudio/projects/GSE157852/GSE157852_CPO_RawCounts.txt.gz'
+}
+
+#read data from file
+raw_counts <- read.delim(countfile, header=TRUE, check.names = FALSE, sep ="")
+```
+
+## 2 – Assess ...
+We compute overview statistics to assess data quality for the control and test conditions.
+
+```{r}
+#general dataset info
+info <- Meta(gse)
+#gpl info
+current_gpl <- names(GPLList(gse))[1]
+current_gpl_info <- Meta(getGEO(current_gpl))
+```
+* __GEO accession number:__ `r geoID`
+* __Publication:__ `r info$title`
+* __Platform title and organism:__ `r current_gpl_info$title`
+* __Platform last updated:__ `r current_gpl_info$last_update_date`
+* __Submission date:__ `r info$submission_date`
+* __Last updated:__ `r info$last_update_date`
+* __Contact address:__ `r info$contact_address`
+* __Contact email:__ `r info$contact_email`
+* __Contact institute:__ `r info$contact_institute`
+```{r}
+#Number of genes
+dim(raw_counts)[1] 
+```
+According to the paper and GEO info, there are triplicates of 3 variables: mock infection 72 hours post-infection (hpi), SARS-CoV-2 24 hpi, and SARS-CoV-2 72 hpi samples, corresponding to the column names.
+```{r}
+#samples
+colnames(raw_counts)
+```
+
+We generalize the conditions into mock and SARS-CoV-2 to represent control and test conditions. We create a vector to identify conditions for each sample, which will be used during normalization. Since the first 3 samples are mock, and the remaining 6 are COVID, all we have to do is:
+```{r}
+sample_groups <- c("mock", "mock", "mock",
+                   "covid", "covid", "covid",
+                   "covid", "covid", "covid") #vector of order of groups
+```
+We might also just use the two 72 hour conditions for better comparison, depending on the distribution of the data.
+
+## 3 – Map
+The dataset already uses HUGO gene symbols as row identifiers, with the exception of loci without identifiers. Nothing can be done about those genes, and they may have significant changes in expression levels, so we will leave them for now. If necessary, we can filter them out later.
+
+## 4 – Clean
+To clean the data, we check for outliers, filter out genes that have low counts, and check whether there are any duplicate genes. We use edgeR to filter low counts, and as specified in Lecture 4 (Isserlin, 2022), we "remove features without at least 1 read per million in n of the samples, where n is the size of the smallest group of replicates". We have 3 samples in each group, so n=3.
+
+### Filter out low counts
+```{r}
+#translate counts into counts per million using edgeR
+cpms = cpm(raw_counts[,1:9]) 
+rownames(cpms) <- rownames(raw_counts)
+
+# get rid of low counts
+keep = rowSums(cpms>1) >=3 # at least 1 read per million in 3 of the samples
+filtered_counts = raw_counts[keep,]
+
+#change in dataset
+dim(filtered_counts) #new dataset dimensions
+dim(raw_counts)[1] - dim(filtered_counts)[1] #genes filtered out
+```
+
+We then check whether any genes are duplicated, in order to see if further processing is needed.
+
+### Check duplicate genes
+```{r}
+#Get summarized counts for each gene
+summarized_gene_counts <- sort(table(rownames(filtered_counts)), decreasing = TRUE)
+
+#determine whether duplicates exist
+which(summarized_gene_counts>1)
+```
+Which() returns integer(0), which means that there are no duplicates in the filtered data. \
+Next, we normalize the filtered data.
+
+# Apply Normalization
+This data is from bulk RNA-seq, so we can normalize by distribution, using Trimmed Mean of M-values (TMM), since this method is specialized for RNASeq data. \
+We can visualize the effects of normalization using boxplots and density plots. \
+
+First, we apply TMM to the filtered dataset, and this normalizes across the sample.
+```{r}
+#Convert dataframe into matrix for edgeR container
+filtered_data_matrix <- as.matrix(filtered_counts)
+#rownames(filtered_data_matrix) #checked that rownames are the same
+#Create an edgeR container for filtered data
+#Create DGEList object with matrix and defined groups
+d = DGEList(counts=filtered_data_matrix, group=sample_groups)
+
+#Calculate normalization factors
+d = edgeR::calcNormFactors(d)
+
+#resulting normalized data
+normalized_counts <- cpm(d)
+```
+
+Now, we need to visualize the effects of the previous normalization steps, comparing filtered_counts to normalized_counts.\
+We first use boxplots to visualize differences. The distribution of pre-normalization data is plotted first.
+```{r}
+# Boxplot for pre-normalization
+predata2plot <- log2(cpm(filtered_counts)) 
+boxplot(predata2plot, xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.5, cex.lab = 0.5, cex.axis = 0.5, 
+        main = "Pre-normalization RNASeq Samples")
+
+#draw median on box plot
+abline(h = median(apply(predata2plot, 2, median)), col = "red", lwd = 0.6, lty = "dashed")
+
+# Boxplot for after normalization
+normalized2plot<- log2(cpm(normalized_counts)) 
+boxplot(normalized2plot, xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.5, cex.lab = 0.5, cex.axis = 0.5, 
+        main = "Normalized RNASeq Samples")
+
+#draw median on box plot
+abline(h = median(apply(normalized2plot, 2, median)), col = "green", lwd = 0.6, lty = "dashed")
+```
+
+Warnings suggest that there is one outlier in each of boxplots 1, 2, 3, 4, 5, 9 for both pre- and post normalization data. These 6 outliers may need to be removed, but we don't have reason to believe a measurement error has occurred. Since 3 of the outliers are in the triplicates of the same condition (S1, S2, S3), it is likely that the outliers are valid measurements. \
+This, combined with the lack of visible difference between the plots, suggest that this dataset is already normalized. Jacob et al. (2020) state that they have performed TPM normalization and variance stabilizing transformation (VST) using DESeq2 on the raw counts, but since the expression data file is named RawCounts, I assumed that the file contained their pre-normalized data. \
+I will visualize using another type of plot to confirm whether there is any change.\
+
+We then plot pre- and post normalization data using density plots. We use a for loop to avoid duplicate code.
+```{r}
+# prepare for 2 density plots: pre- and post normalization
+pre_density <- apply(log2(cpm(filtered_counts)), 2, density)
+normalized_density <- apply(log2(cpm(normalized_counts)), 2, density)
+
+#for loop to create 2 plots
+for (a in 1:2) {
+  if (a == 1) { #first plot
+    counts_density <- pre_density #pre-normalization
+  } else { #second
+    counts_density <- normalized_density #post
+  }
+  
+  #calculate the limits across all the samples
+  xlim <- 0; ylim <- 0
+  for (i in 1:length(counts_density)) {
+    xlim <- range(c(xlim, counts_density[[i]]$x));
+    ylim <- range(c(ylim, counts_density[[i]]$y)) 
+  }
+  cols <- rainbow(length(counts_density)) 
+  ltys <- rep(1, length(counts_density))
+  
+  #plot the first density plot to initialize the plot
+  plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n",
+       ylab="Smoothing density of log2-CPM", 
+       main="Density of Pre-Normalization Data", cex.lab = 0.85)
+  
+  #plot each line
+  for (i in 1:length(counts_density)) 
+      lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+  
+  #create legend
+  legend("topright", colnames(predata2plot), 
+         col=cols, lty=ltys, cex=0.75, border ="blue", text.col = "green4", 
+         merge = TRUE, bg = "gray90")
+}
+```
+\
+From the two density plots, we can conclude that the data is already normalized, so further normalization would not affect any change, unless the method is vastly different.
+
+## Final product:
+```{r}
+knitr::kable(normalized_counts[1:20,], format = "markdown") #show first 20 rows
+```
+It isn't very different from the downloaded dataset, as the normalization performed here was unnecessary. As explained below, I chose to keep values that could not be mapped to current HUGO symbols.
+
+# Interpret, and document
+## What are the control and test conditions of the dataset?
+Exposure to SARS-CoV-2 was tested on brain organoids. According to Jacob et al., test and control conditions involved virus exposure to virus isolate or vehicle control for mock infection (2020). Sequecing of choroid plexus organoids (CPOs) was performed on mock 72 hours post-infection (hpi), SARS-CoV-2 24 hpi, and SARS-CoV-2 72 hpi samples (Jacob et al., 2020). For this assignment, SARS-CoV-2 24 hpi and SARS-CoV-2 72 hpi are generalized to one test condition.
+
+## Why is the dataset of interest to you?
+I am also studying neuroscience, while the effect of SARS-CoV-2 on the body is interesting to explore, so this represented the intersection of these two interests.
+
+## Were there expression values that were not unique for specific genes? How did you handle these?
+Each sample did not have duplicate genes, so expression values and genes were a one-to-one match. Thus, I did not have to handle them. \
+If a sample did have multiple values for one gene and they were not low counts, I would have taken an average, since the values most likely came from different replicates. If, like this dataset, samples correspond to different replicates, one of the values would probably be an error, and it would have to be identified and removed based on normalization and/ore comparison with other measurements.
+
+## Were there expression values that could not be mapped to current HUGO symbols?
+The dataset already uses HUGO gene symbols as row identifiers, but it also includes unnamed genes without current HUGO symbols. Their loci are used to name these. Thus, the expression values are either named by HUGO symbols or loci. If only HUGO symbols can be used for the purposes of this course, I can easily filter out the other expression values, as their rownames all start with "LOC".
+
+## How many outliers were removed?
+Filtering by counts per million reduced the number of genes from 29755 to 12929, so 16826 low counts were filtered out. The outliers identified by the boxplot were not removed, as reasoned previously.\
+Thus, 16826 outliers were removed.
+
+## How did you handle replicates?
+Each of the 3 conditions were measured in triplicate. Each biological replicate contained measurements from 3 Choroid Plexus Organoids (CPOs), and the CPOs were cultured from Human Induced Pluripotent Stem Cells (Jacob et al., 2020). Variation amongst these cells may be different from replicates coming from human patients (in vivo), and limitations of in vitro studies may have to be considered.\
+As specified above, the 3 conditions were generalized into mock and COVID, grouping the SARS-CoV-2 conditions together. However, one condition may have to be selected during further analysis.
+
+## What is the final coverage of your dataset?
+12929 genes out of 29755 remain, which is roughly 43.45% of the original dataset.
+
+# References
+1. Jacob, F., Pather, S. R., Huang, W. K., Zhang, F., Wong, S., Zhou, H., Cubitt, B., Fan, W., Chen, C. Z., Xu, M., Pradhan, M., Zhang, D. Y., Zheng, W., Bang, A. G., Song, H., Carlos de la Torre, J., & Ming, G. L. (2020). Human Pluripotent Stem Cell-Derived Neural Cells and Brain Organoids Reveal SARS-CoV-2 Neurotropism Predominates in Choroid Plexus Epithelium. Cell stem cell, 27(6), 937–950.e9. https://doi.org/10.1016/j.stem.2020.09.016
+2. Isserlin, R. (2022, February 13). BCB420 - Computational Systems Biology - Lecture 4 - Exploring the data and basics of Normalization. Toronto; Quercus.
